@@ -68,6 +68,10 @@ def encode_error(msg: str) -> bytes:
     return f"-{msg}\r\n".encode()
 
 
+def encode_integer(n: int) -> bytes:
+    return f":{n}\r\n".encode()
+
+
 def encode_bulk_string(s: str | None) -> bytes:
     if s is None:
         return b"$-1\r\n"
