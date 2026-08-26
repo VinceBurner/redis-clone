@@ -3,6 +3,7 @@ import unittest
 from redis_clone.resp import (
     encode_bulk_string,
     encode_error,
+    encode_integer,
     encode_simple_string,
     parse_command,
 )
@@ -52,6 +53,20 @@ class EncodeErrorTests(unittest.TestCase):
             encode_error("ERR unknown command"),
             b"-ERR unknown command\r\n",
         )
+
+
+class EncodeIntegerTests(unittest.TestCase):
+    def test_encodes_one(self):
+        self.assertEqual(encode_integer(1), b":1\r\n")
+
+    def test_encodes_zero(self):
+        self.assertEqual(encode_integer(0), b":0\r\n")
+
+    def test_encodes_negative(self):
+        self.assertEqual(encode_integer(-1), b":-1\r\n")
+
+    def test_encodes_large_value(self):
+        self.assertEqual(encode_integer(1234567890), b":1234567890\r\n")
 
 
 class EncodeBulkStringTests(unittest.TestCase):
