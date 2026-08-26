@@ -11,6 +11,7 @@ Run it with:  python3 -m redis_clone.server
 
 from __future__ import annotations
 
+import math
 import selectors
 import socket
 
@@ -208,6 +209,24 @@ class Server:
                 return self._arity_error("del")
             return encode_integer(1 if self.store.delete(args[1]) else 0)
 
+        if command == "EXPIRE":
+            if len(args) != 3:
+                return self._arity_error("expire")
+            try:
+                seconds = float(args[2])
+            except ValueError:
+                return self._not_a_number_error()
+            # NaN would compare False against every deadline and so never
+            # expire; inf would never expire either. Reject both.
+            if not math.isfinite(seconds):
+                return self._not_a_number_error()
+            return encode_integer(1 if self.store.expire(args[1], seconds) else 0)
+
+        if command == "TTL":
+            if len(args) != 2:
+                return self._arity_error("ttl")
+            return encode_integer(self.store.ttl(args[1]))
+
         return encode_error(f"ERR unknown command '{args[0]}'")
 
     @staticmethod
@@ -215,6 +234,10 @@ class Server:
         return encode_error(
             f"ERR wrong number of arguments for '{command}' command"
         )
+
+    @staticmethod
+    def _not_a_number_error() -> bytes:
+        return encode_error("ERR value is not an integer or out of range")
 
 
 def main() -> None:

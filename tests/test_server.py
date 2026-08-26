@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import socket
 import threading
+import time
 import unittest
 
 from redis_clone.server import Server
@@ -149,6 +150,87 @@ class ServerIntegrationTests(unittest.TestCase):
         client.send_raw(encode_command("SET", "pipe", "1") + encode_command("GET", "pipe"))
         self.assertEqual(client.read_reply(), b"+OK\r\n")
         self.assertEqual(client.read_reply(), b"$1\r\n1\r\n")
+
+    # -- expiry ------------------------------------------------------------
+
+    @staticmethod
+    def _integer_reply(reply: bytes) -> int:
+        assert reply.startswith(b":") and reply.endswith(b"\r\n"), reply
+        return int(reply[1:-2])
+
+    def test_ttl_reports_minus_one_without_expiry_and_minus_two_when_absent(self):
+        client = self.connect()
+        client.command("SET", "plain", "v")
+        self.assertEqual(client.command("TTL", "plain"), b":-1\r\n")
+        self.assertEqual(client.command("TTL", "no_such_key"), b":-2\r\n")
+
+    def test_expire_sets_a_ttl_that_ttl_reports_back(self):
+        client = self.connect()
+        client.command("SET", "leased", "v")
+        self.assertEqual(client.command("EXPIRE", "leased", "50"), b":1\r\n")
+
+        # A little wall time passes between the two commands, so 49 is as
+        # correct as 50 here -- assert the range, not an exact tick.
+        remaining = self._integer_reply(client.command("TTL", "leased"))
+        self.assertGreaterEqual(remaining, 45)
+        self.assertLessEqual(remaining, 50)
+
+        # Still readable while the lease is live.
+        self.assertEqual(client.command("GET", "leased"), b"$1\r\nv\r\n")
+
+    def test_key_is_gone_once_its_ttl_elapses(self):
+        client = self.connect()
+        client.command("SET", "brief", "v")
+        self.assertEqual(client.command("EXPIRE", "brief", "0.1"), b":1\r\n")
+        self.assertEqual(client.command("GET", "brief"), b"$1\r\nv\r\n")
+
+        time.sleep(0.25)
+
+        self.assertEqual(client.command("GET", "brief"), b"$-1\r\n")
+        self.assertEqual(client.command("TTL", "brief"), b":-2\r\n")
+        # Expired keys count as absent for DEL too.
+        self.assertEqual(client.command("DEL", "brief"), b":0\r\n")
+
+    def test_expire_on_missing_key_returns_zero(self):
+        self.assertEqual(
+            self.connect().command("EXPIRE", "ghost", "10"), b":0\r\n"
+        )
+
+    def test_set_after_expire_clears_the_ttl(self):
+        client = self.connect()
+        client.command("SET", "reset", "v")
+        client.command("EXPIRE", "reset", "50")
+        client.command("SET", "reset", "v2")  # plain SET drops the old TTL
+        self.assertEqual(client.command("TTL", "reset"), b":-1\r\n")
+
+    def test_expire_with_bad_arguments_returns_error_without_crashing(self):
+        client = self.connect()
+        not_a_number = b"-ERR value is not an integer or out of range\r\n"
+        cases = [
+            (("EXPIRE", "k", "abc"), not_a_number),
+            (("EXPIRE", "k", ""), not_a_number),
+            (("EXPIRE", "k", "nan"), not_a_number),
+            (("EXPIRE", "k", "inf"), not_a_number),
+            (("EXPIRE", "k"), b"-ERR wrong number of arguments for 'expire' command\r\n"),
+            (("EXPIRE",), b"-ERR wrong number of arguments for 'expire' command\r\n"),
+            (("TTL",), b"-ERR wrong number of arguments for 'ttl' command\r\n"),
+            (("TTL", "a", "b"), b"-ERR wrong number of arguments for 'ttl' command\r\n"),
+        ]
+        for args, expected in cases:
+            with self.subTest(args=args):
+                self.assertEqual(client.command(*args), expected)
+        self.assertEqual(client.command("PING"), b"+PONG\r\n")
+
+    def test_expired_key_is_invisible_to_a_second_client(self):
+        a = self.connect()
+        b = self.connect()
+        a.command("SET", "shared_ttl", "v")
+        a.command("EXPIRE", "shared_ttl", "0.1")
+        self.assertEqual(b.command("GET", "shared_ttl"), b"$1\r\nv\r\n")
+
+        time.sleep(0.25)
+
+        self.assertEqual(b.command("GET", "shared_ttl"), b"$-1\r\n")
 
     # -- concurrency -------------------------------------------------------
 
