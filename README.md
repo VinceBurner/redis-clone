@@ -16,8 +16,8 @@ redis_clone/
 ├── requirements.txt # empty; stdlib only
 └── tests/
     ├── test_resp.py    # 17 tests
-    ├── test_store.py   # 27 tests
-    └── test_server.py  # 21 tests, over real sockets
+    ├── test_store.py   # 42 tests
+    └── test_server.py  # 28 tests, over real sockets
 ```
 
 ## Architecture: a single-threaded event loop
@@ -50,6 +50,12 @@ The event loop gets that serialization *structurally*: a command always runs to
 completion before the loop looks at another client, so compound commands are
 atomic by construction and there is no lock to forget later.
 
+**This is no longer hypothetical.** `INCR`/`DECR` are implemented, and
+`DataStore.increment()` performs exactly the read-then-write shown above. It
+needs no lock and no special handling — not because increments are somehow
+safe, but because the existing single-thread guarantee covers a two-step
+operation just as it covers a one-step one.
+
 The costs are real and worth naming:
 
 - **A slow command stalls every client.** Real Redis lives with this; it's why
@@ -76,7 +82,7 @@ Malformed (as opposed to merely incomplete) input gets a RESP error and closes
 
 ## Supported commands
 
-`PING`, `GET`, `SET`, `DEL`, `EXPIRE`, `TTL`. Command names are
+`PING`, `GET`, `SET`, `DEL`, `INCR`, `DECR`, `EXPIRE`, `TTL`. Command names are
 case-insensitive. Anything else returns `-ERR unknown command '<name>'`, and a
 wrong argument count returns `-ERR wrong number of arguments for '<cmd>'
 command` without dropping the connection.
@@ -121,6 +127,31 @@ absent.
 ← :1\r\n
 ```
 
+### INCR key / DECR key
+
+Adds 1 (or subtracts 1) from the integer stored at `key` and replies with the
+new value. A missing key counts as 0, so `INCR` on an absent key yields `1` and
+`DECR` yields `-1`. **An existing TTL is preserved** — incrementing does not
+reset or clear expiry, matching real Redis.
+
+```
+→ *2\r\n$4\r\nINCR\r\n$4\r\nhits\r\n
+← :1\r\n
+
+→ *2\r\n$4\r\nDECR\r\n$4\r\nhits\r\n
+← :0\r\n
+```
+
+If the stored value isn't an integer, the command errors and leaves the value
+untouched:
+
+```
+→ *3\r\n$3\r\nSET\r\n$4\r\nword\r\n$5\r\nhello\r\n
+← +OK\r\n
+→ *2\r\n$4\r\nINCR\r\n$4\r\nword\r\n
+← -ERR value is not an integer or out of range\r\n
+```
+
 ### EXPIRE key seconds
 
 Attaches a TTL to an existing key. `1` if the key was there to receive it, `0`
@@ -152,6 +183,13 @@ Integer reply: remaining whole seconds, `-1` if the key exists with no expiry,
 - **`SET` takes no options.** No `EX`/`PX`/`NX`/`XX`. `DataStore.set()` does
   accept a `ttl_seconds` argument, but nothing on the wire reaches it — set a
   TTL with `EXPIRE`.
+- **`INCR`/`DECR` have no 64-bit overflow check.** Real Redis caps values at a
+  signed 64-bit integer and errors past it; Python's ints are arbitrary
+  precision, so counters here just keep growing. Integer *parsing* is strict
+  though — `"1_0"`, `" 5 "`, and `"+5"` are rejected even though Python's
+  `int()` would accept the first two.
+- **No `INCRBY`/`DECRBY`/`INCRBYFLOAT`.** `DataStore.increment()` takes an
+  arbitrary `delta`, but the wire protocol only exposes ±1.
 
 ## Expiry is lazy, and only lazy
 
@@ -244,22 +282,22 @@ From the same parent directory:
 python3 -m unittest discover -v
 ```
 
-**65 tests**, all passing, in about half a second. Discovery only descends into
+**87 tests**, all passing, in about half a second. Discovery only descends into
 importable packages, so it finds `redis_clone/tests/` without scanning
 unrelated directories.
 
 | File | Count | Covers |
 | --- | --- | --- |
 | `test_resp.py` | 17 | Parsing well-formed commands at several argument counts; incomplete input returning `None` at *every* truncation point rather than raising; malformed input raising; byte-exact output from all four encoders including the `$-1` null bulk string and negative integers. |
-| `test_store.py` | 27 | `get`/`set`/`delete` semantics including empty-string values (distinct from missing); and 19 expiry tests — TTL countdown, rounding down, `-1`/`-2` sentinels, expiry at the exact deadline, `SET` clearing a prior TTL, and `EXPIRE` refusing to resurrect an already-expired key. |
-| `test_server.py` | 21 | End-to-end over **real TCP sockets**, not mocks: every command, arity and protocol errors, pipelining, TTL expiry observed across two clients, and concurrency. |
+| `test_store.py` | 42 | `get`/`set`/`delete` semantics including empty-string values (distinct from missing); increment behaviour (missing keys starting at 0, strict integer parsing, failed increments leaving the value untouched); and 23 expiry tests — TTL countdown, rounding down, `-1`/`-2` sentinels, expiry at the exact deadline, `SET` clearing a prior TTL, `EXPIRE` refusing to resurrect an already-expired key, and `INCR` preserving a live TTL. |
+| `test_server.py` | 28 | End-to-end over **real TCP sockets**, not mocks: every command, arity and protocol errors, pipelining, a counter shared across two clients, TTL expiry observed across two clients, and concurrency. |
 
 Two details worth knowing if you edit these:
 
 - **The expiry tests use a fake clock, not `sleep`.** They patch the `time`
   module *as bound inside `store.py`* rather than patching `time.monotonic`
   globally — a global patch would also hit the background server thread and
-  `selectors`' internals during `test_server.py`. All 19 run in ~4ms.
+  `selectors`' internals during `test_server.py`. All 23 run in ~4ms.
 - **There is deliberately no threaded concurrency test for `DataStore`.** It
   carries no lock by design, so such a test would assert a guarantee the class
   does not make.
