@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from redis_clone.store import DataStore
+from redis_clone.store import NOT_AN_INTEGER, DataStore
 
 
 class DataStoreTests(unittest.TestCase):
@@ -43,6 +43,71 @@ class DataStoreTests(unittest.TestCase):
         # Distinct from a missing key: get() must return "" not None.
         self.store.set("foo", "")
         self.assertEqual(self.store.get("foo"), "")
+
+
+class IncrementTests(unittest.TestCase):
+    def setUp(self):
+        self.store = DataStore()
+
+    def test_increment_on_missing_key_creates_it_at_one(self):
+        self.assertEqual(self.store.increment("n", 1), 1)
+        self.assertEqual(self.store.get("n"), "1")
+
+    def test_decrement_on_missing_key_returns_minus_one(self):
+        self.assertEqual(self.store.increment("n", -1), -1)
+        self.assertEqual(self.store.get("n"), "-1")
+
+    def test_repeated_increments_accumulate(self):
+        for expected in (1, 2, 3, 4):
+            self.assertEqual(self.store.increment("n", 1), expected)
+        self.assertEqual(self.store.get("n"), "4")
+
+    def test_increments_and_decrements_interleave(self):
+        self.store.increment("n", 1)
+        self.store.increment("n", 1)
+        self.assertEqual(self.store.increment("n", -1), 1)
+        self.assertEqual(self.store.get("n"), "1")
+
+    def test_increments_an_existing_value(self):
+        self.store.set("n", "10")
+        self.assertEqual(self.store.increment("n", 5), 15)
+
+    def test_decrements_past_zero_into_negatives(self):
+        self.store.set("n", "3")
+        self.assertEqual(self.store.increment("n", -5), -2)
+        self.assertEqual(self.store.get("n"), "-2")
+
+    def test_increments_a_negative_stored_value(self):
+        self.store.set("n", "-5")
+        self.assertEqual(self.store.increment("n", 2), -3)
+
+    def test_value_is_stored_back_as_a_string(self):
+        # The keyspace is dict[str, str]; increment must not leak an int.
+        self.store.increment("n", 7)
+        self.assertIsInstance(self.store.get("n"), str)
+
+    # -- rejecting non-integers -------------------------------------------
+
+    def test_non_integer_value_raises_with_redis_message(self):
+        self.store.set("n", "hello")
+        with self.assertRaises(ValueError) as ctx:
+            self.store.increment("n", 1)
+        self.assertEqual(str(ctx.exception), "value is not an integer or out of range")
+        self.assertEqual(str(ctx.exception), NOT_AN_INTEGER)
+
+    def test_various_non_integers_are_all_rejected(self):
+        # int() would accept the last two; Redis does not, so neither do we.
+        for bad in ("hello", "1.5", "", " ", "0x10", "+5", "1_0", " 5 "):
+            with self.subTest(value=bad):
+                self.store.set("n", bad)
+                with self.assertRaises(ValueError):
+                    self.store.increment("n", 1)
+
+    def test_failed_increment_leaves_the_value_untouched(self):
+        self.store.set("n", "hello")
+        with self.assertRaises(ValueError):
+            self.store.increment("n", 1)
+        self.assertEqual(self.store.get("n"), "hello")
 
 
 class ExpiryTests(unittest.TestCase):
@@ -161,6 +226,35 @@ class ExpiryTests(unittest.TestCase):
         self.store.set("k", "v", ttl_seconds=10)
         self.advance(9.999)
         self.assertEqual(self.store.ttl("k"), 0)
+
+    # -- interaction with increment() --------------------------------------
+
+    def test_increment_preserves_an_existing_ttl(self):
+        self.store.set("n", "1", ttl_seconds=100)
+        self.advance(10)
+        self.assertEqual(self.store.increment("n", 1), 2)
+        # The countdown must continue from where it was, not reset or clear.
+        self.assertEqual(self.store.ttl("n"), 90)
+
+    def test_incremented_key_still_expires_on_its_original_schedule(self):
+        self.store.set("n", "1", ttl_seconds=10)
+        self.advance(5)
+        self.store.increment("n", 1)
+        self.advance(6)  # past the original deadline
+        self.assertIsNone(self.store.get("n"))
+
+    def test_increment_on_expired_key_starts_from_zero(self):
+        self.store.set("n", "5", ttl_seconds=10)
+        self.advance(11)
+        # The old value is gone, so this is a fresh key, not 5 + 1.
+        self.assertEqual(self.store.increment("n", 1), 1)
+        # And a fresh key carries no expiry.
+        self.assertEqual(self.store.ttl("n"), -1)
+
+    def test_increment_does_not_add_a_ttl_to_a_persistent_key(self):
+        self.store.set("n", "1")
+        self.store.increment("n", 1)
+        self.assertEqual(self.store.ttl("n"), -1)
 
     # -- interaction with delete() -----------------------------------------
 

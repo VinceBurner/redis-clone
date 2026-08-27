@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
+import re
 import time
+
+# Redis's own wording, reused verbatim so clients see the familiar text.
+NOT_AN_INTEGER = "value is not an integer or out of range"
+
+# Explicit [0-9] rather than \d: \d also matches non-ASCII digits, and
+# Python's int() additionally accepts underscores ("1_0" -> 10) and
+# surrounding whitespace. Redis accepts none of those, so parse strictly.
+_INTEGER = re.compile(r"^-?[0-9]+$")
 
 
 class DataStore:
@@ -88,6 +97,43 @@ class DataStore:
             self._expiries.pop(key, None)
             return True
         return False
+
+    def increment(self, key: str, delta: int) -> int:
+        """Add `delta` to the integer at `key` and return the new value.
+
+        A missing (or expired) key counts as 0, so INCR on an absent key
+        yields 1 and DECR yields -1. Raises ValueError if the stored value
+        is not an integer.
+
+        On why this needs no extra locking: it doesn't, and that is not a
+        new guarantee — it is the existing one applying to a two-step
+        operation. This method still only ever runs on the single
+        event-loop thread, so the read-then-write below cannot interleave
+        with another client's read-then-write; the loop finishes this
+        command before it looks at another socket. Note that the class
+        docstring uses exactly this operation as the example of what
+        per-method locking would *fail* to protect: under threads, a lock
+        around get() and a lock around set() would still let two
+        increments interleave and lose one. Single-threaded execution is
+        what makes the sequence atomic, not any lock.
+
+        Writes straight to _data rather than calling set(), because set()
+        deliberately clears the expiry and an increment must preserve it
+        (matching real Redis, where INCR leaves the TTL alone).
+        """
+        self._drop_if_expired(key)
+
+        current = self._data.get(key)
+        if current is None:
+            value = 0
+        else:
+            if not _INTEGER.match(current):
+                raise ValueError(NOT_AN_INTEGER)
+            value = int(current)
+
+        new_value = value + delta
+        self._data[key] = str(new_value)  # _expiries left untouched
+        return new_value
 
     def expire(self, key: str, ttl_seconds: float) -> bool:
         """Attach a new expiry to an existing key.

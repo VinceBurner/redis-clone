@@ -209,6 +209,17 @@ class Server:
                 return self._arity_error("del")
             return encode_integer(1 if self.store.delete(args[1]) else 0)
 
+        if command in ("INCR", "DECR"):
+            if len(args) != 2:
+                return self._arity_error(command.lower())
+            delta = 1 if command == "INCR" else -1
+            try:
+                return encode_integer(self.store.increment(args[1], delta))
+            except ValueError as exc:
+                # Non-integer stored value: report it and keep the
+                # connection open, same as any other command error.
+                return encode_error(f"ERR {exc}")
+
         if command == "EXPIRE":
             if len(args) != 3:
                 return self._arity_error("expire")

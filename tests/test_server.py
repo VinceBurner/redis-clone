@@ -151,6 +151,72 @@ class ServerIntegrationTests(unittest.TestCase):
         self.assertEqual(client.read_reply(), b"+OK\r\n")
         self.assertEqual(client.read_reply(), b"$1\r\n1\r\n")
 
+    # -- INCR / DECR -------------------------------------------------------
+
+    def test_incr_creates_and_accumulates(self):
+        client = self.connect()
+        self.assertEqual(client.command("INCR", "hits"), b":1\r\n")
+        self.assertEqual(client.command("INCR", "hits"), b":2\r\n")
+        self.assertEqual(client.command("INCR", "hits"), b":3\r\n")
+        self.assertEqual(client.command("GET", "hits"), b"$1\r\n3\r\n")
+
+    def test_decr_counts_back_down_and_past_zero(self):
+        client = self.connect()
+        client.command("SET", "gauge", "2")
+        self.assertEqual(client.command("DECR", "gauge"), b":1\r\n")
+        self.assertEqual(client.command("DECR", "gauge"), b":0\r\n")
+        self.assertEqual(client.command("DECR", "gauge"), b":-1\r\n")
+        self.assertEqual(client.command("GET", "gauge"), b"$2\r\n-1\r\n")
+
+    def test_decr_on_missing_key_returns_minus_one(self):
+        self.assertEqual(self.connect().command("DECR", "fresh"), b":-1\r\n")
+
+    def test_incr_on_non_integer_errors_without_crashing(self):
+        client = self.connect()
+        client.command("SET", "word", "hello")
+        expected = b"-ERR value is not an integer or out of range\r\n"
+
+        self.assertEqual(client.command("INCR", "word"), expected)
+        self.assertEqual(client.command("DECR", "word"), expected)
+
+        # The connection survives, the server survives, and crucially the
+        # stored value was not clobbered by the failed increment.
+        self.assertEqual(client.command("PING"), b"+PONG\r\n")
+        self.assertEqual(client.command("GET", "word"), b"$5\r\nhello\r\n")
+        self.assertEqual(self.connect().command("PING"), b"+PONG\r\n")
+
+    def test_incr_decr_arity_errors(self):
+        client = self.connect()
+        cases = [
+            (("INCR",), b"-ERR wrong number of arguments for 'incr' command\r\n"),
+            (("INCR", "a", "b"), b"-ERR wrong number of arguments for 'incr' command\r\n"),
+            (("DECR",), b"-ERR wrong number of arguments for 'decr' command\r\n"),
+            (("DECR", "a", "b"), b"-ERR wrong number of arguments for 'decr' command\r\n"),
+        ]
+        for args, expected in cases:
+            with self.subTest(args=args):
+                self.assertEqual(client.command(*args), expected)
+        self.assertEqual(client.command("PING"), b"+PONG\r\n")
+
+    def test_two_clients_share_one_counter(self):
+        a = self.connect()
+        b = self.connect()
+        self.assertEqual(a.command("INCR", "shared_counter"), b":1\r\n")
+        self.assertEqual(b.command("INCR", "shared_counter"), b":2\r\n")
+        self.assertEqual(a.command("INCR", "shared_counter"), b":3\r\n")
+        self.assertEqual(b.command("GET", "shared_counter"), b"$1\r\n3\r\n")
+
+    def test_incr_preserves_a_ttl_over_the_wire(self):
+        client = self.connect()
+        client.command("SET", "leased_counter", "1")
+        self.assertEqual(client.command("EXPIRE", "leased_counter", "50"), b":1\r\n")
+        self.assertEqual(client.command("INCR", "leased_counter"), b":2\r\n")
+
+        # INCR must not have cleared the lease back to -1.
+        remaining = self._integer_reply(client.command("TTL", "leased_counter"))
+        self.assertGreaterEqual(remaining, 45)
+        self.assertLessEqual(remaining, 50)
+
     # -- expiry ------------------------------------------------------------
 
     @staticmethod
